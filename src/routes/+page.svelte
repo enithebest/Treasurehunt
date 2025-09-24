@@ -1,120 +1,136 @@
 <script>
-    import { onMount } from "svelte";
-    import { getDistance, getGreatCircleBearing, isPointWithinRadius } from "geolib";
+  import { onMount } from "svelte";
+  import { writable, derived } from "svelte/store";
+  import {
+    isPointWithinRadius,
+    getPreciseDistance,
+    getGreatCircleBearing,
+  } from "geolib";
 
-    const target = { latitude: 42.05913363079434, longitude: 19.51725368912721 };
-    const radiusMeters = 5;
+  // 🎯 Target coordinates
+  const target = { latitude: 42.05913363079434, longitude: 19.51725368912721 };
 
-    let userLat = null;
-    let userLon = null;
-    let distance = null;
-    let bearing = null;
-    let insideCircle = false;
-    let heading = 0;           // Compass heading of the phone (degrees)
-    let arrowRotation = 0;     // Final rotation for the arrow
+  // ── Reactive stores
+  const position = writable(null);
+  const heading = writable(0);
+  const beta = writable(0);
+  const gamma = writable(0);
 
-    let watchId;
+  // ── Derived values
+  const distance = derived(position, ($pos) =>
+    $pos ? getPreciseDistance($pos, target) : null
+  );
+  const inRadius = derived(position, ($pos) =>
+    $pos ? isPointWithinRadius($pos, target, 5) : false
+  );
+  const bearing = derived(position, ($pos) =>
+    $pos ? getGreatCircleBearing($pos, target) : 0
+  );
+  const arrowRotation = derived([bearing, heading], ([$b, $h]) => {
+    let rot = $b - $h;
+    return (rot + 360) % 360;
+  });
 
-    function updatePosition(pos) {
-        userLat = pos.coords.latitude;
-        userLon = pos.coords.longitude;
+  let errorMsg = "";
+  let permissionGranted = false;
 
-        distance = getDistance(
-            { latitude: userLat, longitude: userLon },
-            target
-        );
-
-        bearing = getGreatCircleBearing(
-            { latitude: userLat, longitude: userLon },
-            target
-        );
-
-        insideCircle = isPointWithinRadius(
-            { latitude: userLat, longitude: userLon },
-            target,
-            radiusMeters
-        );
-
-        updateArrowRotation();
-    }
-
-    function updateArrowRotation() {
-        if (bearing !== null && heading !== null) {
-            // difference between where we need to go and where device is facing
-            let diff = bearing - heading;
-            // Normalize to 0–360
-            arrowRotation = (diff + 360) % 360;
+  async function requestPermission() {
+    if (
+      typeof DeviceOrientationEvent !== "undefined" &&
+      typeof DeviceOrientationEvent.requestPermission === "function"
+    ) {
+      try {
+        const resp = await DeviceOrientationEvent.requestPermission();
+        if (resp === "granted") {
+          permissionGranted = true;
+          setupOrientation();
+        } else {
+          errorMsg = "Keine Berechtigung für Kompassdaten.";
         }
+      } catch (e) {
+        errorMsg = "Kompass-Berechtigung fehlgeschlagen.";
+      }
+    } else {
+      permissionGranted = true;
+      setupOrientation();
     }
+  }
 
-    function geoError(err) {
-        console.error("Geolocation error:", err);
-    }
-
+  function setupOrientation() {
     function handleOrientation(e) {
-        // alpha is degrees clockwise from magnetic north
-        // Some browsers use 'webkitCompassHeading' for iOS
-        const rawHeading =
-            e.webkitCompassHeading !== undefined
-                ? e.webkitCompassHeading
-                : e.alpha;
-
-        if (rawHeading != null) {
-            heading = rawHeading;
-            updateArrowRotation();
-        }
+      if (e.webkitCompassHeading !== undefined) {
+        heading.set(e.webkitCompassHeading); // iOS
+      } else if (e.absolute === true) {
+        heading.set(e.alpha || 0); // Android
+      }
+      beta.set(e.beta || 0);
+      gamma.set(e.gamma || 0);
     }
+    window.addEventListener("deviceorientationabsolute", handleOrientation, true);
+    window.addEventListener("deviceorientation", handleOrientation, true);
+  }
 
-    onMount(() => {
-        if ("geolocation" in navigator) {
-            watchId = navigator.geolocation.watchPosition(updatePosition, geoError, {
-                enableHighAccuracy: true,
-                maximumAge: 0,
-                timeout: 10000
+  onMount(() => {
+    if ("geolocation" in navigator) {
+      const watchId = navigator.geolocation.watchPosition(
+        (pos) => {
+          if (pos.coords.accuracy <= 20) {
+            position.set({
+              latitude: pos.coords.latitude,
+              longitude: pos.coords.longitude,
             });
-        }
-        if (window.DeviceOrientationEvent) {
-            window.addEventListener("deviceorientationabsolute", handleOrientation, true);
-            // Fallback for browsers not supporting 'absolute'
-            window.addEventListener("deviceorientation", handleOrientation, true);
-        }
-
-        return () => {
-            if (watchId) navigator.geolocation.clearWatch(watchId);
-            window.removeEventListener("deviceorientationabsolute", handleOrientation);
-            window.removeEventListener("deviceorientation", handleOrientation);
-        };
-    });
+          }
+        },
+        (err) => {
+          console.error("Standortfehler:", err);
+          errorMsg = "Standort konnte nicht ermittelt werden.";
+        },
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
+      );
+      return () => navigator.geolocation.clearWatch(watchId);
+    }
+  });
 </script>
 
-<main>
-<div class="flex flex-col items-center justify-center min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-800 dark:text-gray-100">
-    <h1 class="text-2xl font-bold mb-4">Navigation to Target</h1>
+<!-- Layout container -->
+<div class="flex flex-col items-center justify-between w-screen h-screen p-4 text-center">
+  <!-- Circle shows if inside radius -->
+  <div class="rounded-full shadow-md w-[40vw] h-[40vw] max-w-40 max-h-40 mt-8
+              transition-colors duration-300
+              { $inRadius ? 'bg-green-500' : 'bg-red-500' }"></div>
 
-    <div class="mb-6 text-center">
-        {#if userLat && userLon}
-            <p>Distance to target: {distance} m</p>
-            <p>Bearing to target: {bearing}°</p>
-            <p>Phone heading: {Math.round(heading)}°</p>
-            <p>Status:
-                {insideCircle
-                    ? "Inside 5 m radius"
-                    : "Outside radius"}
-            </p>
-        {:else}
-            <p>Waiting for GPS signal…</p>
-        {/if}
+  <!-- Distance display -->
+  {#if $distance !== null}
+    <p class="mt-4 text-lg">Abstand: {$distance.toFixed(1)} m</p>
+  {:else}
+    <p class="mt-4 text-lg">Abstand: wird berechnet …</p>
+  {/if}
+
+  <!-- Compass -->
+  <div class="flex flex-col items-center mb-8">
+    {#if !permissionGranted}
+      <button
+        on:click={requestPermission}
+        class="px-4 py-2 mb-4 text-white bg-blue-600 rounded-lg shadow hover:bg-blue-700">
+        📍 Kompass aktivieren
+      </button>
+    {/if}
+
+    <!-- Compass circle -->
+    <div class="relative flex items-center justify-center w-32 h-32 border-4 border-gray-800 rounded-full bg-gray-100">
+      <!-- Arrow -->
+      <div
+        class="absolute w-0 h-0 border-l-[12px] border-r-[12px] border-l-transparent border-r-transparent border-b-[35px] border-b-red-600 origin-[50%_90%] transition-transform duration-150"
+        style="transform: rotate({$arrowRotation}deg);">
+      </div>
     </div>
 
-    <div
-        class="w-16 h-16 mb-6 rounded-full"
-        style="background-color: {insideCircle ? 'green' : 'red'};"
-    ></div>
+    <p class="mt-2 text-base">➡ Ziel: {$bearing.toFixed(0)}°</p>
+    <p class="text-base">🧭 Heading: {$heading.toFixed(0)}°</p>
+    <p class="text-sm">β: {$beta.toFixed(0)}° | γ: {$gamma.toFixed(0)}°</p>
+  </div>
 
-    <!-- Arrow that rotates toward the target -->
-    <p class="text-4xl font-bold inline-block"
-       style="transform: rotate({arrowRotation}deg); transition: transform 0.1s linear;">
-        ➡️
-    </p>
+  {#if errorMsg}
+    <p class="text-red-600 font-semibold mt-2">{errorMsg}</p>
+  {/if}
 </div>
-</main>
